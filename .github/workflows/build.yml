@@ -1,9 +1,4 @@
-name: Build SimpleGrassFlower (from zip)
-
-# Upload the source .zip to the repo (any folder) and push. No need to extract it:
-# the workflow finds the zip, opens it, locates xmake.lua inside and builds.
-# Several zips? The one committed most recently wins, or pick one by hand with
-# Actions > Run workflow > "zip".
+name: Build SimpleGrassFlower
 
 on:
   push:
@@ -11,95 +6,15 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
-    inputs:
-      zip:
-        description: "Path of the source zip inside the repo (empty = auto-detect)"
-        required: false
-        default: ""
 
 permissions:
   contents: write
 
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # full history: needed to tell which zip is the newest
-
-      - name: Find and open the source zip
-        id: src
-        shell: bash
-        env:
-          INPUT_ZIP: ${{ github.event.inputs.zip }}
-        run: |
-          set -euo pipefail
-          rm -rf _src
-
-          has_xmake() { unzip -Z1 "$1" 2>/dev/null | grep -v '^__MACOSX/' | grep -qE '(^|/)xmake\.lua$'; }
-
-          # 1) which zip?
-          ZIP=""
-          if [ -n "${INPUT_ZIP:-}" ]; then
-            [ -f "$INPUT_ZIP" ] || { echo "::error::zip '$INPUT_ZIP' does not exist in the repo"; exit 1; }
-            has_xmake "$INPUT_ZIP" || { echo "::error::'$INPUT_ZIP' has no xmake.lua inside"; exit 1; }
-            ZIP="$INPUT_ZIP"
-          else
-            CANDIDATES=""
-            while IFS= read -r -d '' Z; do
-              has_xmake "$Z" || continue
-              TS=$(git log -1 --format=%ct -- "$Z" 2>/dev/null || true)
-              CANDIDATES+="${TS:-0} $Z"$'\n'
-            done < <(find . -type f -iname '*.zip' \
-                       -not -path './.git/*' -not -path './_src/*' -not -path './dist/*' -print0)
-            # newest commit first; ties broken by name (higher version number wins)
-            ZIP=$(printf '%s' "$CANDIDATES" | sort -k1,1nr -k2,2r | head -n1 | cut -d' ' -f2-)
-            COUNT=$(printf '%s' "$CANDIDATES" | grep -c . || true)
-            [ "${COUNT:-0}" -gt 1 ] && echo "::notice::$COUNT source zips found, using the newest: $ZIP"
-          fi
-
-          # 2) open it, or fall back to plain files in the repo
-          if [ -n "$ZIP" ]; then
-            echo "Opening $ZIP"
-            mkdir -p _src
-            unzip -q -o "$ZIP" -d _src
-            rm -rf _src/__MACOSX
-            find _src -name .DS_Store -delete
-            ROOT=_src
-            echo "from=$ZIP" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::no zip with xmake.lua found, looking for extracted files in the repo"
-            ROOT=.
-            echo "from=repo files" >> "$GITHUB_OUTPUT"
-          fi
-
-          # 3) shallowest xmake.lua = project root
-          FILE=$(find "$ROOT" -name xmake.lua \
-                   -not -path './.git/*' -not -path '*/build/*' -not -path '*/.xmake/*' -not -path './dist/*' \
-                   | awk '{ print gsub("/","/") " " $0 }' | sort -n | head -n1 | cut -d' ' -f2-)
-          if [ -z "$FILE" ]; then
-            echo "::error::xmake.lua not found (no zip contains one, and the repo has none)"
-            find . -not -path './.git/*' | head -60
-            exit 1
-          fi
-          DIR=$(dirname "$FILE")
-          echo "Project dir: $DIR"
-          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
-
-          # 4) sanity checks + version
-          [ -f "$DIR/src/main.cpp" ] || echo "::warning::$DIR/src/main.cpp not found, build may fail"
-          VER=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('version',''))" "$DIR/levimod.json" 2>/dev/null || true)
-          echo "version=${VER:-dev}" >> "$GITHUB_OUTPUT"
-          echo "### Source" >> "$GITHUB_STEP_SUMMARY"
-          echo "- from: \`${ZIP:-repo files}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- project dir: \`$DIR\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- version: \`${VER:-dev}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Setup Android NDK r28c
         id: ndk
@@ -112,36 +27,72 @@ jobs:
         with:
           xmake-version: latest
 
-      - name: Cache xmake packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.xmake
-          key: xmake-pkgs-${{ runner.os }}-v1
-          restore-keys: xmake-pkgs-${{ runner.os }}-
+      - name: Find and unpack source
+        id: proj
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1. Pick the newest .zip (by version-sort of its path) that contains xmake.lua
+          BEST=""
+          while IFS= read -r -d '' Z; do
+            if unzip -Z1 "$Z" 2>/dev/null | grep -qE '(^|/)xmake\.lua$'; then
+              echo "Source zip candidate: $Z"
+              BEST="$Z"
+            fi
+          done < <(find . -type f -iname '*.zip' \
+                     -not -path './.git/*' -not -path './_src/*' -print0 | sort -z -V)
+
+          # 2. Unpack it, or fall back to loose files in the repo
+          if [ -n "$BEST" ]; then
+            echo "Using zip: $BEST"
+            rm -rf _src && mkdir -p _src
+            unzip -q -o "$BEST" -d _src
+            ROOT=_src
+          else
+            echo "No source zip found, searching repo files"
+            ROOT=.
+          fi
+
+          # 3. Shallowest xmake.lua under ROOT
+          FILE=$(find "$ROOT" -name xmake.lua \
+                   -not -path '*/.git/*' -not -path '*/build/*' \
+                   -not -path '*/.xmake/*' -not -path './dist/*' \
+                   $( [ "$ROOT" = "." ] && echo "-not -path ./_src/*" ) \
+                 | awk '{ print gsub("/","/") " " $0 }' | sort -n | head -n1 | cut -d' ' -f2-)
+
+          if [ -z "$FILE" ]; then
+            echo "::error::xmake.lua not found in repo or in any .zip"
+            find . -not -path './.git/*' | head -60
+            exit 1
+          fi
+
+          DIR=$(dirname "$FILE")
+          echo "Project dir: $DIR"
+          test -f "$DIR/src/main.cpp" || { echo "::error::$DIR/src/main.cpp missing"; exit 1; }
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       - name: Configure
-        working-directory: ${{ steps.src.outputs.dir }}
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: xmake f -y -p android -a arm64-v8a -m release --ndk="${{ steps.ndk.outputs.ndk-path }}"
 
       - name: Build
-        working-directory: ${{ steps.src.outputs.dir }}
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: xmake -y
 
       - name: Collect outputs
-        working-directory: ${{ steps.src.outputs.dir }}
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: |
-          set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          find build -name "SimpleGrassFlower.levipack"   -exec cp {} "$GITHUB_WORKSPACE/dist/" \;
-          find build -name "libSimpleGrassFlower.so"      -exec cp {} "$GITHUB_WORKSPACE/dist/" \;
-          test -f "$GITHUB_WORKSPACE/dist/SimpleGrassFlower.levipack" \
-            || { echo "::error::SimpleGrassFlower.levipack was not produced"; exit 1; }
-          cd "$GITHUB_WORKSPACE/dist" && sha256sum * | tee SHA256SUMS.txt
+          find build -name "SimpleGrassFlower.levipack" -exec cp {} "$GITHUB_WORKSPACE/dist/" \;
+          find build -name "libSimpleGrassFlower.so" -exec cp {} "$GITHUB_WORKSPACE/dist/" \;
+          ls -la "$GITHUB_WORKSPACE/dist"
+          test -f "$GITHUB_WORKSPACE/dist/SimpleGrassFlower.levipack"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SimpleGrassFlower-${{ steps.src.outputs.version }}
+          name: SimpleGrassFlower
           path: dist/*
           if-no-files-found: error
 
